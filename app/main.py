@@ -10,7 +10,12 @@ from app.db import get_conn, init_db
 from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
+import asyncio
+import re
+import shutil
 
+SESSION_ID_RE = re.compile(r"[0-9a-f]{32}")
+CLEANUP_INTERNAL = 600
 llm = genai.Client()
 LLM_MODEL = "gemini-3.8-flash"
 MIN_SCORE = 0.7
@@ -22,10 +27,49 @@ Aturan:
 - Sebutkan sumber dengan format (hlm. N) setelah klaim yang relevan.
 - Jawab dalam bahasa Indonesia, ringkas."""
 
+def delete_session_data(session_id: str) -> bool:
+    if not SESSION_ID_RE.fullmatch(session_id):
+        return False
+    with get_conn() as conn:
+        row = conn.execute(
+            "DELETE FROM sessions WHERE id = %s RETURNING id",
+            [session_id]
+        ).fetchone()
+
+    shutil.rmtree(BASE_DIR / session_id, ignore_errors=True)
+    return row is not None
+
+def cleanup_expired() -> int:
+    with get_conn() as conn:
+        expired = [r[0] for r in conn.execute(
+            "SELECT id FROM sessions WHERE expires_at <= now()"
+        ).fetchall()]
+        active = {r[0] for r in conn.execute("SELECT id FROM sessions").fetchall()}
+
+    for sid in expired:
+        delete_session_data(sid)
+
+    if BASE_DIR.exists():
+        for d in BASE_DIR.iterdir():
+            if d.is_dir() and d.name not in active:
+                shutil.rmtree(d, ignore_errors=True)
+
+    return len(expired)
+
+async def cleanup_loop():
+    while True:
+        try:
+            await asyncio.to_thread(cleanup_expired)
+        except Exception as e:
+            print("cleanup error:", e)
+        await asyncio.sleep(CLEANUP_INTERNAL)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    task = asyncio.create_task(cleanup_loop())
     yield
+    task.cancel()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -165,4 +209,12 @@ def ask(session_id: str, req: SearchRequest):
     return {
         "answer": generate_answer(context, req.query),
         "sources": [{"page": h["page"], "score": h["score"]} for h in hits],
+    }
+
+@app.delete("/sessions/{session_id}")
+def end_session(session_id: str):
+    if not delete_session_data(session_id):
+        raise HTTPException(404, "Sesi tidak ditemukan")
+    return {
+        "deleted": True
     }
